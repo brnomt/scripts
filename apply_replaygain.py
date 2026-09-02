@@ -5,12 +5,19 @@ apply_replaygain.py
 Aplica la ganancia ReplayGain DIRECTAMENTE a las muestras de audio, para
 reproductores que ignoran las etiquetas (tags) ReplayGain.
 
+NOT IMPORTANTE: este script NORMALIZA todos los archivos de audio. Ajusta el
+volumen de cada archivo para que su sonoridad se acerque al target de
+ReplayGain (-18 LUFS), de modo que todos suenen a un nivel similar.
+
 Como funciona:
 1. Lee la etiqueta REPLAYGAIN_TRACK_GAIN (o _ALBUM_) de cada archivo.
+   Si el archivo NO tiene etiqueta ReplayGain, la CALCULA midiendo la
+   sonoridad integrada del audio con `ffmpeg ebur128` y la convierte a un
+   valor ReplayGain (target -18 LUFS).
 2. Mide el pico real del audio con `ffmpeg volumedetect`.
 3. Aplica una ganancia LINEAL pura con el filtro `volume` de ffmpeg,
    limitando la ganancia positiva para que el pico NUNCA supere el techo
-   (-headroom dBFS). No usa limitadores ni compresores: CERO clipping y
+   (-headroom dBFS). Sin limitadores ni compresores: CERO clipping y
    CERO saturacion.
 4. Reescribe el archivo y pone las etiquetas de ganancia a 0 dB para que el
    proceso sea IDEMPOTENTE (se puede re-ejecutar sin doble ganancia).
@@ -48,6 +55,10 @@ AUDIO_EXTS = {
 }
 
 DEFAULT_MIN_GAIN = 0.05  # dB
+
+# Sonoridad objetivo de ReplayGain 2.0, en LUFS (equivale a -18 dBFS).
+# Ganancia calculada = ref - sonoridad_integrada.
+RG_REFERENCE_LUFS = -18.0
 
 
 def require_ffmpeg():
@@ -180,6 +191,18 @@ def measure_peak_db(path):
     return float(m.group(1))
 
 
+def measure_loudness(path):
+    """Mide la sonoridad integrada (LUFS) del primer stream de audio."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+           "-map", "0:a:0", "-af", "ebur128=metadata=1", "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    m = re.search(r"I:\s*([-+]?\d+(?:\.\d+)?)\s*LUFS", r.stderr)
+    if not m:
+        raise RuntimeError("no se pudo medir la sonoridad del audio")
+    return float(m.group(1))
+
+
 def codec_spec(codec, sample_fmt=None):
     """Argumentos de ffmpeg para re-encodar segun el codec.
     Devuelve None si el codec no se puede re-escribir con ffmpeg."""
@@ -282,8 +305,14 @@ def process_file(path, args):
         gain = track if args.mode == "track" else album
         if gain is None:
             gain = album if args.mode == "track" else track
+        origen = "tag"
         if gain is None:
-            return ("skip", "sin etiqueta replaygain", 0.0)
+            if not args.calc:
+                return ("skip", "sin etiqueta replaygain", 0.0)
+            # Sin etiqueta: mide la sonoridad y calcula el ReplayGain.
+            lufs = measure_loudness(path)
+            gain = RG_REFERENCE_LUFS - lufs
+            origen = f"calculado ({lufs:+.1f} LUFS)"
 
         target = gain + args.preamp
         if abs(target) < args.min_gain:
@@ -316,7 +345,7 @@ def process_file(path, args):
                     f"codec no re-encodable con ffmpeg: {info['codec']}",
                     applied)
 
-        detalle = (f"{applied:+.2f} dB  (tag {gain:+.2f} dB, "
+        detalle = (f"{applied:+.2f} dB  (gain {gain:+.2f} dB [{origen}], "
                    f"pico {peak:+.2f} dB, techo {-args.headroom:+.2f} dB, "
                    f"codec {info['codec']})")
 
@@ -394,6 +423,9 @@ def main(argv=None):
                     help="ganancia extra en dB aplicada a todo (default: 0)")
     ap.add_argument("--min-gain", type=float, default=DEFAULT_MIN_GAIN,
                     help="ignorar si |ganancia| < esto (default: 0.05 dB)")
+    ap.add_argument("--no-calc", dest="calc", action="store_false",
+                    help="no calcular ReplayGain en archivos sin etiqueta "
+                         "(por defecto se calcula midiendo la sonoridad)")
     ap.add_argument("--jobs", type=int, default=1,
                     help="archivos en paralelo (default: 1)")
     ap.add_argument("--dry-run", action="store_true",
